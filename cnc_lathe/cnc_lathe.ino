@@ -1,364 +1,330 @@
-volatile uint8_t q = 1, w = 0, c = 0; //  q, w - для обработки прерывания с клавиатуры, c - передает в loop команду от клавиатуры
-volatile bool esc = false;    // флаг выброса из штатных проходов резца. Выбрасывает по true. Сменяется на true при нажатии любой клавиши кроме Пробел и Enter
-volatile bool pause = false;  // флаг заморозки штатных проходов резца. Замораживается по true. Сменяется на true только при нажатии пробела, обратно - по Enter
+#include <PS2Keyboard.h>
 
-// назначение пинов концевикам
-byte endPinLeft = 15;
-byte endPinBack = 16;
-byte endPinForward = 17;
-byte endPinRight = 18;
-// назначение пинов моторам
-byte pinPulseX = 9;
-byte pinPulseY = 10;
-byte pinDirX = 11;
-byte pinDirY = 12;
-// назначение констант
-int delayCutX = 8;
-int delayCutY = 10;
-int delayRunX = 1;
-int delayRunY = 1;
-int edgeStep = 44 *4;        // шаг стандартного ребра в импульсах (к-во десяток * 4)
-int depth = 5555;           // глубина погружения резца в импульсах - от заднего бордюра
-int miniDepth = 180;        // глубина погружения резца в импульсах - для снятия продольного слоя
-int endX = 5030 *4;
-int homeX = 320 *4 ; // дописать переопределение для заготовок: перевернутой8, укороченой9, перевернутойУкороченой0
-int homeY = 720;     // (замеряем по факту)
-//int borderLeft = 300 *4;   // бордюр слева
-//int borderBack = 0;       // бордюр задний - в нулевой точке
-//int finishLineX = 1270;   // зона срабатывания левого концевика (на 1,25 мм [50импульсов] правее бордюра)
-//int finishLineY = 500;    // зона срабатывания тыльного концевика
-// назначение стартовых значений координатам правого угла правого резца
-volatile int currentX = 6000 *4;
-volatile int currentY = 6000;
-// назначение массива координат ребер изделия по X (различаются для разных резцов)
-volatile int edges[100];
+const int DataPin = 2;
+const int IRQpin =  3;
+
+PS2Keyboard keyboard;
+
+bool X = false;               // constant to the motor designation
+bool Y = true;                // constant to the motor designation
+bool FAST = true;             // constant to the motor speed designation
+bool SLOW = false;            // constant to the motor speed designation
+bool ESC = true;              // constant to escape moving
+bool OK = false;              // constant to continue moving
+
+bool isHomePushed[] = {false, false};
+byte pinHome[] = {15, 16};            // analog endcaps pins
+byte PUL[] = {9, 10};                 // digital motors pulse control pins
+byte DIR[] = {11, 12};                // digital motors dir control pins
+int timeOut[][2] = {{3, 1}, {3, 1}};  // {{xSlow, xFast}, {ySlow, yFast}} timeouts of fast and slow moving at axis
+int factor[] = {4*4, 4*20};           // number of pulses in one tenth = reducer factor * driver factor.
+int step[] = {44, 3};                 // number of tenths between slots, number of tenths to a dive step
+int home[] = {320, 10};               // values of home locations - then endcups get pressing
+int border[] = {5040, 140};           // extremely far locations
+int widthCutter = 20;                 // the cutter width
+volatile int location[] = {300, 142}; // current location values on start
+
+int homeSlotPivot = 500;
+int numberOfSlots = 92;
 
 void setup() {
-  Serial.begin(57600);
-  Serial.println(11);
-  // инициация встроенного диода для теста клавиатуры
-  pinMode(LED_BUILTIN, OUTPUT);
-  // инициация пинов на прием сигнала от концевиков (4 штуки)
-  pinMode(15, INPUT);   // A1 - leftEnd
-  pinMode(16, INPUT);   // A2 - backEnd
-  pinMode(17, INPUT);   // A3 - forwardEnd
-  pinMode(18, INPUT);   // A4 - rightEnd
-  // инициация пинов на передачу управляющих команд моторам (4 штуки)
+  delay(1000);
+  keyboard.begin(DataPin, IRQpin);
+  Serial.begin(9600);
+  Serial.println("Keyboard Test:");
+  
+  // init endcaps pins
+  pinMode(15, INPUT_PULLUP);
+  pinMode(16, INPUT_PULLUP);
+  
+  // init motors control pins
   pinMode(9, OUTPUT);           
   pinMode(10, OUTPUT);
   pinMode(11, OUTPUT);
   pinMode(12, OUTPUT);
-  // инициация прерывания 1 - всегда ожидается на D3 (прерывания 0 - на D2)),
-  // функция keyPress вызывается при нисходящем срабатывании сигнала на D3
-  attachInterrupt(1, keyPress, FALLING);
-  // инициализация координат ребер домашней позицией по X
-//  resetCutter();
-//  goHomeX();
-//  test();
 }
 
-void loop() {                 // вход в основной рабочий цикл
-  c = 0;  q = 1; w = 0;       // обнуление буферов для ввода с клавиатуры и команды для резца
-  while (c == 0) delay(100);  // барьер - пропустит только когда в с придет код нажатой клавиши - через прерывание от клавиатуры
-  delay(500);                 // дополнительные полсекунды на регистрирование отпускания нажатой клавиши
-  esc = false;                // разрешаем проход по циклам движения резца
-  pause = false;              // cнимаем с паузы
-  Serial.println(c, HEX);     // отчитываемся в консоль о принятой команде
-    // отработка вариантов нажатых клавиш:
-    // выбор резца (одинарный / двойной):
-  if (c == 0x16) setCutterSolo();           // 1
-  if (c == 0x1E) setCutterDuo();            // 2
-    // макродвижения резца
-  if (c == 0x05) goHomeX();                 // F1
-  if (c == 0x06) makeTailLeft();            // F2
-  if (c == 0x04) makeNotch92();             // F3
-  if (c == 0x0C) makeTailRight();           // F4
-    // движения резца в диапазоне одного ребра
-  if (c == 0x03) goEdgeLeft();              // F5
-  if (c == 0x0B) goHomeY();                 // F6
-  if (c == 0x83) goY(depth, true);          // F7
-  if (c == 0x0A) goEdgeRight();             // F8
-    // микродвижения резца
-  if (c == 0x01) goX(currentX - 4, true);   // F9
-  if (c == 0x09) goY(currentY - 60, false); // F10
-  if (c == 0x78) goY(currentY + 60, true);  // F11
-  if (c == 0x07) goX(currentX + 4, true);   // F12
-    // движения резца на стандартный шаг
-  if (c == 0x6B) goX(currentX - edgeStep, true);   // Arrow Left
-  if (c == 0x72) goY(currentY - miniDepth, false); // Arrow Back
-  if (c == 0x75) goY(currentY + miniDepth, true);  // Arrow Forward
-  if (c == 0x74) goX(currentX + edgeStep, true);   // Arrow Right
-    // крупные программы
-  if (c == 0x1C) workSolo();                       // A
-  if (c == 0x1B) workDuo();                        // S
-  if (c == 0x23) workLeftTailOnShiftReverse();     // D
-  if (c == 0x2B) makeCornerRight();                // F
-    // быстрые движения в левый - правый край
-  if (c == 0x6C) goX(homeX, false);                 // Home
-  if (c == 0x69) goX(endX, false);                  // End
-//  if (c == 0x) ;           //
-}
-
-//void test() {
-//  for (int i = 0; i < 1000; i++) {
-//    Serial.print("endPinLeft: ");
-//    Serial.print(isEndPressed(endPinLeft));
-//    Serial.print("; endPinForward: ");
-//    Serial.print(isEndPressed(endPinForward));
-//    Serial.println(";");
-//    delay(100);
-//  }
-//}
-
-void keyPress() {
-  if (q > 1 && q < 11)w |= digitalRead(2) << q - 2;
-  if (++q > 11) {
-    esc = true;               //любая клавиша кроме пробела и Enter - выбрасывает из текущего цикла, если таковой имеется
-    c = w;                    //...открывает барьрер в loop для выполнения вновь введенной команды
-    q = 1; w = 0;             //...обнуляет буфера ввода с клавиатуры
+void loop() {
+  if (keyboard.available()) {
+    char c = keyboard.read();
+    
+    // test to some keys are pressed
+    if      (c == PS2_INSERT)     go(X, FAST, location[X] - step[X]);
+    else if (c == PS2_DELETE)     go(X, SLOW, location[X] - step[X]);
+    else if (c == PS2_HOME)       go(Y, SLOW, border[Y]);
+    else if (c == PS2_END)        go(Y, FAST, home[Y]);
+    else if (c == PS2_PAGEUP)     go(X, FAST, location[X] + step[X]);
+    else if (c == PS2_PAGEDOWN)   go(X, SLOW, location[X] + step[X]);
+    else if (c == PS2_F9)         go(X, FAST, home[X]);
+    else if (c == PS2_F10)        go(X, SLOW, home[X]);
+    else if (c == PS2_F11)        go(X, SLOW, border[X]);
+    else if (c == PS2_F12)        go(X, FAST, border[X]);
+    else if (c == PS2_UPARROW)    go(Y, FAST, location[Y] + factor[Y]);
+    else if (c == PS2_LEFTARROW)  go(X, FAST, location[X] - factor[X]);
+    else if (c == PS2_RIGHTARROW) go(X, FAST, location[X] + factor[X]);
+    else if (c == PS2_DOWNARROW)  go(Y, FAST, location[Y] - factor[Y]);
+    else if (c == 'r')            resetPivotSlotHere(); // change the home slot pivot so that the current location becomes the current slot pivot
+    else if (c == 'a')            addLastSlot();        // increment number of slots
+    else if (c == 'x')            resetHome(X);
+    else if (c == 'y')            resetHome(Y);
+    else if (c == 's')            makeSlotsAll();
+    else if (c == 'c')            makeTail();
+    else if (c == 't')            testShift();
+//    else if (c == PS2_ESC)        wait();
+//    else if (c == '+')            resque();
+    else Serial.println("A command for the button " + String(c) + " is not founded");
   }
 }
 
-// мигание диодом указанное количество раз
-void blinker(int counter) {
-  Serial.println("    blinker() - start with - " + String(counter));
-  while (counter-- > 0) {
+void testShift() {
+  for (int i = 0; i < 100; i++) {
+    if (go(X, FAST, location[X] + 15)) return;
+    if (go(Y, FAST, location[Y] + 15)) return;
+    if (go(X, FAST, location[X] - 15)) return;
+    if (go(Y, FAST, location[Y] - 15)) return;
+  }
+}
+
+bool wait() {
+  char c = '0';
+  do {            // wait Enter or Esc or '+', right here
     delay(500);
-    digitalWrite(LED_BUILTIN, HIGH);
+    if (keyboard.available()) 
+      c = keyboard.read();
+  } while (c != PS2_ENTER && c != PS2_ESC && c != '+');
+  
+  if (c == PS2_ESC)
+    return ESC;
+  
+  if (c == '+')
+    if (resque())
+      return ESC;
+  
+  return OK;
+}
+
+bool resque() {
+  int marker = location[X];
+  if (resetHome(Y))
+    return ESC;
+  
+  char c = '0';
+  do {            // wait Enter or Esc, right here
     delay(500);
-    digitalWrite(LED_BUILTIN, LOW);
-  }
-  Serial.println("    blinker() - finish"); 
-}
-
-// обнуление координат ребер
-void resetCutter() {
-  Serial.println("  resetCutter() - start");
-  for (int i = 0; i < 100; i++)
-    edges[i] = homeX;
-  Serial.println("  resetCutter() - finish - reseted");
-}
-
-// назначение координат ребер для позиционирования правой кромки моно-резца
-void setCutterSolo() {
-  Serial.println("  setCutterSolo() - start");
-  resetCutter();                // обнуление координат ребер
-  edges[97] = homeX;            // отрезок 97-98 формирует правую секцию левого хвоста изделия
-  edges[98] = 470*4;            // формирует -1-е (широкое) ребро слева
-  edges[99] = 500*4;            // формирует -1-е (широкое) ребро справа
-  edges[0]  = 510*4;            // нулевой стандартный проход одиночным резцом
-  for (int i = 1; i < 92; i++)  // пачка проходов через стандартный интервал
-    edges[i] = edges[i-1] + edgeStep;
-  edges[92] = 4523*4;            // формирует 92-е (широкое) ребро слева
-  edges[93] = 4553*4;            // формирует 92-е (широкое) ребро справа
-  edges[94] = 5030*4;            // отрезок 92-93 формирует правый хвост изделия
-  blinker(1);                    // мигаем один раз - одинарный резец
-  Serial.println("  setCutterSolo() - finish");
+    if (keyboard.available()) 
+      c = keyboard.read();
+  } while (c != PS2_ENTER && c != PS2_ESC);
   
-}
-
-void setCutterDuo() {
-  Serial.println("  setCutterDuo() - start");
-  resetCutter();                 // обнуление координат ребер
-  edges[0] = 544*4;              // нулевой стандартный проход двойным резцом
-  for (int i = 1; i <= 90; i++)  // пачка проходов через стандартный интервал
-    edges[i] = edges[i-1] + edgeStep;
-  for (int i = 91; i <= 94; i++) // 4 холостых дубля после edges[90] - для getEdgeRight()
-    edges[i] = edges[i-1];       
-  blinker(2);                    // мигаем два раза - двойной резец
-  Serial.println("  setCutterDuo() - finish");
-}
-
-bool isEndPressed(int endPin) {   // проверяет, нажат ли указаный концевик
-  int weight = 0;
-  for (int i = 0; i < 10; i++)
-      weight += analogRead(endPin);
-  bool pressed = weight > 10150;
-  return (pressed);
-}
-
-void sendPulse(char motor, int delayPulse) {   // один такт указаного мотора с указаной паузой
-  Serial.println("    x" + String(currentX) + "." + String(isEndPressed(endPinLeft)) + " y" + String(currentY) + "." + String(isEndPressed(endPinBack)));  
-  int pulsePin = 0;
-  if (motor == 'X') pulsePin = pinPulseX;
-  if (motor == 'Y') pulsePin = pinPulseY;
-  digitalWrite(pulsePin, HIGH);
-  digitalWrite(pulsePin, LOW);
-  delay(delayPulse);
-}
-
-void goHomeY() {                                // позиционируем суппорт во фронтальную линию
-  Serial.println("  goHomeY() - start from " + String(currentY));
-  if (currentY != homeY && !esc) {           // выполняем позиционирование только если не стоим на линии фронта
-    digitalWrite(pinDirY, LOW);                 // направление - назад
-    while (!isEndPressed(endPinBack) && !esc) { // откатываем суппорт пока не нажат концевик и не esc
-      currentY--;
-      sendPulse('Y', delayRunY);
-    } 
-    digitalWrite(pinDirY, HIGH);                // направление - вперед
-    while (isEndPressed(endPinBack) && !esc) {   // откатываем суппорт на линию фронта (отпуск концевика)
-      currentY++;
-      sendPulse('Y', delayRunY);
-    }
-    currentY = homeY;                        // фиксируем ноль (линию фронта) по отпуску концевика
-  }
-  Serial.println("  goHomeY() - finish. currentY set to homeY = " + String(currentY));
-}
-
-void goHomeX() {                                // позиционируем суппорт в левую домашнюю точку
-  Serial.println("  goHomeX() - start from " + String(currentX));
-  if (currentY != homeY && !esc) goHomeY();  // выходим на линию фронта (currentY == homeY)
-  if (currentX != homeX && !esc) {           // выполняем позиционирование только если не стоим в домашней точке
-    digitalWrite(pinDirX, HIGH);                // направление - налево
-    while (!isEndPressed(endPinLeft) && !esc) {  // откатываем суппорт пока не нажат концевик и не esc
-      currentX--;
-      sendPulse('X', delayRunX);
-    }
-    digitalWrite(pinDirX, LOW);                 // направление - направо
-    while (isEndPressed(endPinLeft) && !esc) {   // откатываем суппорт до отпускания концевика
-      currentX++;
-      sendPulse('X', delayCutX);
-    }
-    currentX = homeX;                        // фиксируем линию фронта по отпуску концевика
-  }
-  Serial.println("  goHomeX() - finish. currentX set to homeX = " + String(currentX));
-}
-
-void goX(int targetX, bool cut) {
-  Serial.println("  goX() - start - from " + String(currentX) + " to " + String(targetX) + " " + String(cut ? " cut" : " run"));
-  int distance = targetX - currentX;
-  int stepPulse = distance > 0 ? 1 : -1;
-  int delayX = cut ? delayCutX : delayRunX;
-  digitalWrite(pinDirX, distance < 0 ? HIGH : LOW);
-  while (currentX != targetX && !esc) {
-     currentX += stepPulse;
-     sendPulse('X', delayX);
-  }
-  Serial.println("  goX() - finish at " + String(currentX));
-}
-
-void goY(int targetY, bool cut) {
-  Serial.println("  goY() - start - from " + String(currentY) + " to " + String(targetY) + String(cut ? " cut" : " run"));
-  int distance = targetY - currentY;
-  int stepPulse = distance > 0 ? 1 : -1;
-  int delayY = cut ? delayCutY : delayRunY;
-  digitalWrite(pinDirY, distance > 0 ? HIGH : LOW);
-  while (currentY != targetY && !esc) {
-     currentY += stepPulse;
-     sendPulse('Y', delayY);
-  }
-  Serial.println("  goY() - finish at " + String(currentY));
-}
-
-void makeTailLeft() {
-  Serial.println("makeTailLeft() - start");
-  goHomeY();
-  setCutterSolo();
-  makeNotchWide(edges[97], edges[98] - 10);
-  makeNotch(edges[99]);
-  goHomeY();
-  Serial.println("makeTailLeft() - finish");
-}
-
-void makeTailRight() {
-  Serial.println("makeTailRight() - start");
-  goHomeY();
-  setCutterSolo();
-  makeNotch(edges[92]);
-  makeNotchWide(edges[93] + 10, edges[94]);
+  if (c == PS2_ESC)
+    return ESC;
   
-  goX(edges[93], false);
-  makeCornerRight();                   //  оформление правого угла одним проходом
-
-  goHomeY();
-  Serial.println("makeTailRight() - finish");
+  if (go(Y, SLOW, marker))
+    return ESC;
+  
+  return OK;
 }
 
-void makeCornerRight() {
-  goY(depth + miniDepth, true);
-  goX(edges[94], true);
-  goHomeX();
+
+// push a tenth and align the axis location value
+bool goTenth(bool axis, bool isFast, bool isRise) {
+  char c = keyboard.read();
+  
+  // on Esc - return ESC
+  if (c == PS2_ESC)
+    return ESC;
+  
+  // on Enter - call pause
+  if (c == PS2_ENTER) // call wait()
+    if (wait())       // on ESC from wait() - return ESC
+      return ESC;     // escalate if ESC
+
+  if (c == '+')       // call resque()
+    if (resque())     // eject the cutter to home[Y], will return to the task if Enter will been folowed
+      return ESC;     // on ESC from wait() - return ESC
+
+  // move forward by one tenth
+  for (int i = 0; i < factor[axis]; i++)
+  {
+    digitalWrite(DIR[axis], isRise ? HIGH : LOW);
+    digitalWrite(PUL[axis], HIGH);
+    digitalWrite(PUL[axis], LOW);
+    delay(timeOut[axis, isFast]);
+  }
+
+  // align the axis location value
+  location[axis] += (isRise ? 1 : -1);
+  return OK;
 }
 
-void makeNotch(int positionX) {
-  Serial.println("  makeNotch() - start" );
-  goHomeY();
-  goX(positionX, false);
-  goY(depth, true);
+bool go(bool axis, bool isFast, int target) {
+  bool isRise = (target > location[axis]);
+  int distance = abs(target - location[axis]);
+  
+  for (int i = 0; i < distance; i++)
+    if (goTenth(axis, isFast, isRise))          // call goTenth()
+      return ESC;                               // escalate if ESC
+  
+  return OK;
+}
+
+bool isHomePressed(bool axis) {
+  return analogRead(pinHome[axis]) > 1000 ? true : false; // the maximum value is 1023
+}
+
+bool resetHome(bool axis) {
+  // if it's an executing of reset X, then reset Y at first
+  if (axis == X)
+    resetHome(Y);
+
+  // cancel the rehoming if we are already at home
+  if (location[axis] == home[axis])
+    return OK;
+
+  // move by tenths - from rear - until the endcup turn off - if the support is outside the working area
+  while (isHomePressed(axis))
+    if (go(axis, FAST, location[axis] + 1))
+      return ESC;
+
+  // move by tenths - to home - until the endcup turn on - if the support is into the working area
+  while (!isHomePressed(axis))
+    if (go(axis, FAST, location[axis] - 1))
+      return ESC;
+
+  // slowly rollout to the home location - until the endcup turn off
+  digitalWrite(DIR[axis], HIGH);        // direction is to the right
+  while (isHomePressed(axis)) {         // move by pulses - to the home - until the endcup became on. ESC is useless only at this move
+    digitalWrite(PUL[axis], HIGH);
+    digitalWrite(PUL[axis], LOW);
+    delay(timeOut[axis][SLOW]);
+  }
+
+  // reset current location to the axis home value
+  location[axis] = home[axis];
+  return OK;
+}
+
+bool makeSlotEdge(int target) {
+  resetHome(Y);
+  if (go(X, FAST, target))
+    return ESC;
+  if (go(Y, SLOW, border[Y]))
+    return ESC;
   delay(1000);
-  goHomeY();
-  Serial.println("  makeNotch() - start" );
+  if (resetHome(Y))
+    return ESC;
+  return OK;
 }
 
-void makeNotch92() {
-  Serial.println("makeNotch92() - start");
-  goHomeY();
-  int edgeCurrent = getEdgeRight();
-  while (edgeCurrent <= 91 && !esc)
-    makeNotch(edges[edgeCurrent++]);
-  goHomeY();
-  Serial.println("makeNotch92() - finish");
-}
+bool makeSlotWide(int left, int right) {
+  if (resetHome(Y))
+    return ESC;
+  if (go(X, FAST, left))
+    return ESC;
 
-void makeNotchWide(int left, int right) {
-  Serial.println("  makeNotchWide() - start - from " + String(left) + " to " + String(right));
-  goHomeY();
-  goX(left, false);
-  while (currentY <= depth - 2*miniDepth && !esc) {
-    goY(currentY + miniDepth, true);
-    goX(right, true);
-    goY(currentY + miniDepth, true);
-    goX(left, true);
+  while ((location[Y] < border[Y] - step[Y])) {
+    if (go(Y, SLOW, location[Y] + step[Y]))
+      return ESC;
+    if (go(X, SLOW, right))
+      return ESC;
+    if (go(Y, SLOW, location[Y] + step[Y]))
+      return ESC;
+    if (go(X, SLOW, left))
+      return ESC;
   }
-  goHomeY();
-  Serial.println("  makeNotchWide() - finish" );
+  delay(1000);
+  if (go(X, SLOW, right))
+      return ESC;
+  delay(1000);
+  if (resetHome(Y))
+      return ESC;
+  return OK;
 }
 
-int getEdgeRight() {      // return number of first edge situated to the right from currentX
-  Serial.println("      getEdgeRight() - start");
-  int edgeRight = 94;
-  for (int i = 94; i >= 0; i--)
-    if (currentX < edges[i])
-      edgeRight = i;
-  Serial.println("      getEdgeRight() - finish - return edge " + String(edgeRight) + " on " + String(edges[edgeRight]/4) + "mm");
-  return edgeRight;
+bool makeSlotsAll() {
+  // if the home slot pivot is to the right - move to the home slot pivot
+  if (location[X] < homeSlotPivot)
+    if (go(X, FAST, homeSlotPivot))
+      return ESC;
+    
+  // let's sloting...
+  int curentSlotIndex = (location[X] - homeSlotPivot) / step[X];
+  for (int i = curentSlotIndex; i < numberOfSlots; i++) {
+    int currentSlotPivot = homeSlotPivot + i * step[X];
+    if (makeSlotWide(currentSlotPivot + 5, currentSlotPivot + 18))
+      return ESC;
+    if (makeSlotEdge(currentSlotPivot))
+      return ESC;
+    
+    // if this is not the home slot, - cut the left edge of the ring to the right
+    if (i > 0)
+      if (makeSlotEdge(currentSlotPivot - 25))
+      return ESC;
+
+    // go 5 tenths to the left from the next slot pivot
+    if (go(X, FAST, currentSlotPivot + step[X] + 5))
+      return ESC;
+  }
+  return OK;
 }
 
-void goEdgeRight() {
-  Serial.println("goEdgeRight() - start");
-  goHomeY();
-  int edgeRight = getEdgeRight();
-  goX(edges[edgeRight], false);
-  Serial.println("goEdgeRight() - finish");
+bool makeTail() {
+  // take current X location as pivot of cornering
+  int pivot = location[X];
+  
+  // draft cutting
+  if (makeSlotWide(pivot + 5, border[X]))
+    return ESC;
+
+  // move to pivot
+  if (go(X, FAST, pivot))
+    return ESC;
+  
+  // clean cutting
+  if (go(Y, SLOW, border[Y] + 2))
+    return ESC;
+  if (go(X, SLOW, border[X]))
+    return ESC;
+
+  // move to the right edge of the last ring
+  if (resetHome(Y))
+    return ESC;
+  if (go(X, FAST, pivot - 30))
+    return ESC;
+
+  return OK;
 }
 
-void goEdgeLeft() {
-  Serial.println("goEdgeLeft() - start");
-  goHomeY();
-  int edgeLeft = getEdgeRight();
-  if (edgeLeft > 0) edgeLeft--;   // позиция слева - это которая слева от правой
-  if (edgeLeft > 0 && edges[edgeLeft] == currentX) edgeLeft--;  // если позиция слева от правой оказалась текущей, то берем следующую слева
-  goX(edges[edgeLeft], false);
-  Serial.println("goEdgeLeft() - finish");
+bool resetPivotSlotHere() {
+  // this function is colled then sloting gone wrong
+  // it resets location X and resets the homeSlotPivot so that the current X location becomes the left edge of the next slot
+  // it don't call sloting!!!
+  
+  // reset X, markering the distance to the home[X]
+  int marker = 0;       
+  while (!isHomePressed[X]) {
+    if (go(X, FAST, location[X] - 1))
+      return ESC;
+    marker++;
+  }
+  if (resetHome[X])
+    return ESC;
+
+  // return support to the initial location
+  if (go(X, FAST, marker))
+    return ESC;
+  
+  // reset the home slot pivot to reinstate slotting from the current location as the left edge of the new slot
+  // compute the shift of the current position relative to the left edge of the slot we are holding
+  int shift = (location[X] - homeSlotPivot) / step[X];
+  
+  // if the shift is > 20 tenths - move the slotting to the left, otherwise - to the right
+  homeSlotPivot += (shift > 20) ? (shift - step[X]) : shift;
+
+  return OK;
 }
 
-void workSolo(){
-  setCutterSolo();
-  makeTailLeft();
-  makeNotch92();
-  makeTailRight();
-}
-
-void workDuo() {
-  setCutterDuo();
-  makeNotch92();
-}
-
-void workLeftTailOnShiftReverse() {
-  makeNotchWide(4600*4, 5000*4);
+void addLastSlot() {
+  Serial.println("reorder number of slots from " + String(numberOfSlots) + " to " + String(++numberOfSlots));
 }
 
 //----------------EOF------------------------
-
-//дописать угловой проход в левом хвосте
-//написать проход направо до позиции 5000*4
